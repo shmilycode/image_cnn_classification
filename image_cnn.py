@@ -16,12 +16,15 @@ class ImageCNN(object):
   # Input Layer
   # Reshape X to 4-D tensor: [batch_size, width, height, channels]
   # images are 100x100 pixels, and have 3 color channel
-  def __init(self, features, labels):
+  def __init(self):
     self.input_features = tf.placeholder(tf.float32, [None,None,3])
     self.input_labels = tf.placeholder(tf.int32)
+    self.dropout_keep_prob = tf.placeholder(tf.float32, name="dropout_keep_prob")
+
     pooled_outputs = []
     num_filters = [32, 64]
     filter_sizes = [5, 5]
+    num_classes = 100
     for i, filter_size in enumerate(filter_sizes)):
       num_filter = num_filters[i]
       with tf.name_scope("conv-maxpool-%s" % filter_size)
@@ -55,42 +58,50 @@ class ImageCNN(object):
         pooled_outputs.append(pooled)
 
     # Combine all the pooled features
-    num_filters_total = num_filters[-1] * len(filter_sizes)
-    self.h_pool = tf.concat(pooled_outputs, 3)
-    self.h_pool_flat = tf.reshape(self.h_pool, [-1, num_filters_total])
-
     # Flatten tensor into a batch of vectors
     # Input Tensor Shape: [batch_size, 25, 25, 64]
     # Output Tensor Shape: [batch_size, 25 * 25 * 64]
-    pool2_flat = tf.reshape(pool2, [-1, 25 * 25 * 64])
+    num_filters_total = num_filters[-1] * np.pow(100/(2*len(filter_sizes)), 2)
+    self.h_pool = tf.concat(pooled_outputs, 3)
+    self.h_pool_flat = tf.reshape(self.h_pool, [-1, num_filters_total])
   
     # Dense Layer
     # Densely connected layer with 1024 neurons
     # Input Tensor Shape: [batch_size, 25 * 25 * 64]
     # Output Tensor Shape: [batch_size, 1024]
-    dense = tf.layers.dense(inputs=pool2_flat, units=1024, activation=tf.nn.relu)
+    dense = tf.layers.dense(inputs=self.h_pool_flat, units=1024, activation=tf.nn.relu)
   
     # Add dropout operation; 0.6 probability that element will be kept
-    dropout = tf.layers.dropout(
-        inputs=dense, rate=0.4, training=mode == tf.estimator.ModeKeys.TRAIN)
+    # Add dropout
+    with tf.name_scope("dropout"):
+      self.h_drop = tf.nn.dropout(self.dense, self.dropout_keep_prob)
   
     # Logits layer
     # Input Tensor Shape: [batch_size, 1024]
     # Output Tensor Shape: [batch_size, 100]
     logits = tf.layers.dense(inputs=dropout, units=100)
-  
-    predictions = {
-        # Generate predictions (for PREDICT and EVAL mode)
-        "classes": tf.argmax(input=logits, axis=1),
-        # Add `softmax_tensor` to the graph. It is used for PREDICT and by the
-        # `logging_hook`.
-        "probabilities": tf.nn.softmax(logits, name="softmax_tensor")
-    }
-    if mode == tf.estimator.ModeKeys.PREDICT:
-      return tf.estimator.EstimatorSpec(mode=mode, predictions=predictions)
-  
-    # Calculate Loss (for both TRAIN and EVAL modes)
-    loss = tf.losses.sparse_softmax_cross_entropy(labels=labels, logits=logits)
+ 
+    # Final (unnormalized) scores and predictions
+    with tf.name_scope("output"):
+        W = tf.get_variable(
+            "W",
+            shape=[num_filters_total, num_classes],
+            initializer=tf.contrib.layers.xavier_initializer())
+        b = tf.Variable(tf.constant(0.1, shape=[num_classes]), name="b")
+        l2_loss += tf.nn.l2_loss(W)
+        l2_loss += tf.nn.l2_loss(b)
+        self.scores = tf.nn.xw_plus_b(self.h_drop, W, b, name="scores")
+        self.predictions = tf.argmax(self.scores, 1, name="predictions")
+
+    # Calculate mean cross-entropy loss
+    with tf.name_scope("loss"):
+        losses = tf.nn.softmax_cross_entropy_with_logits(logits=self.scores, labels=self.input_labels)
+        self.loss = tf.reduce_mean(losses) + l2_reg_lambda * l2_loss
+
+    # Accuracy
+    with tf.name_scope("accuracy"):
+        correct_predictions = tf.equal(self.predictions, tf.argmax(self.input_labels, 1))
+        self.accuracy = tf.reduce_mean(tf.cast(correct_predictions, "float"), name="accuracy")
   
     # Configure the Training Op (for TRAIN mode)
     if mode == tf.estimator.ModeKeys.TRAIN:
@@ -122,42 +133,109 @@ def preprocess():
   eval_labels = np.asarray(labels[train_data_len:], dtype=np.int32)
   return  train_data,train_labels,eval_data,eval_labels
 
-
 def train(train_data, train_label, eval_data, eval_labels):
   with tf.Graph.as_default():
     session_conf = tf.ConfigProto(
-      allow_soft_placement=FLAGS.allow_soft_placement,
-      log_device_placement=FLAGS.log_device_placement)
+      allow_soft_placement=True,
+      log_device_placement=False)
     sess = tf.Session(config=session_conf)
     with sess.as_default():
-      image_cnn = Image
-  # Create the Estimator
-  image_classifier = tf.estimator.Estimator(
-      model_fn=cnn_model_fn, model_dir="./image_convnet_model")
+      image_cnn = ImageCNN()
 
-  # Set up logging for predictions
-  # Log the values in the "Softmax" tensor with label "probabilities"
-  tensors_to_log = {"probabilities": "softmax_tensor"}
-  logging_hook = tf.train.LoggingTensorHook(
-      tensors=tensors_to_log, every_n_iter=50)
+  # Define Training procedure
+  global_step = tf.Variable(0, name="global_step", trainable=False)
+  optimizer = tf.train.AdamOptimizer(1e-3)
+  grads_and_vars = optimizer.compute_gradients(cnn.loss)
+  train_op = optimizer.apply_gradients(grads_and_vars, global_step=global_step)
 
-  # Train the model
-  train_input_fn = tf.compat.v1.estimator.inputs.numpy_input_fn(
-      x={"x": train_data},
-      y=train_labels,
-      batch_size=100,
-      num_epochs=None,
-      shuffle=True)
-  image_classifier.train(
-      input_fn=train_input_fn,
-      steps=20000,
-      hooks=[logging_hook])
+  # Keep track of gradient values and sparsity (optional)
+  grad_summaries = []
+  for g, v in grads_and_vars:
+      if g is not None:
+          grad_hist_summary = tf.summary.histogram("{}/grad/hist".format(v.name), g)
+          sparsity_summary = tf.summary.scalar("{}/grad/sparsity".format(v.name), tf.nn.zero_fraction(g))
+          grad_summaries.append(grad_hist_summary)
+          grad_summaries.append(sparsity_summary)
+  grad_summaries_merged = tf.summary.merge(grad_summaries)
 
-  # Evaluate the model and print results
-  eval_input_fn = tf.compat.v1.estimator.inputs.numpy_input_fn(
-      x={"x": eval_data}, y=eval_labels, num_epochs=1, shuffle=False)
-  eval_results = image_classifier.evaluate(input_fn=eval_input_fn)
-  print(eval_results)
+  # Output directory for models and summaries
+  timestamp = str(int(time.time()))
+  out_dir = os.path.abspath(os.path.join(os.path.curdir, "runs", timestamp))
+  print("Writing to {}\n".format(out_dir))
+
+  # Summaries for loss and accuracy
+  loss_summary = tf.summary.scalar("loss", cnn.loss)
+  acc_summary = tf.summary.scalar("accuracy", cnn.accuracy)
+
+  # Train Summaries
+  train_summary_op = tf.summary.merge([loss_summary, acc_summary, grad_summaries_merged])
+  train_summary_dir = os.path.join(out_dir, "summaries", "train")
+  train_summary_writer = tf.summary.FileWriter(train_summary_dir, sess.graph)
+
+  # Dev summaries
+  dev_summary_op = tf.summary.merge([loss_summary, acc_summary])
+  dev_summary_dir = os.path.join(out_dir, "summaries", "dev")
+  dev_summary_writer = tf.summary.FileWriter(dev_summary_dir, sess.graph)
+
+  # Checkpoint directory. Tensorflow assumes this directory already exists so we need to create it
+  checkpoint_dir = os.path.abspath(os.path.join(out_dir, "checkpoints"))
+  checkpoint_prefix = os.path.join(checkpoint_dir, "model")
+  if not os.path.exists(checkpoint_dir):
+      os.makedirs(checkpoint_dir)
+  saver = tf.train.Saver(tf.global_variables(), max_to_keep=5)
+
+  # Initialize all variables
+  sess.run(tf.global_variables_initializer())
+
+  def train_step(x_batch, y_batch):
+      """
+      A single training step
+      """
+      feed_dict = {
+        cnn.input_x: x_batch,
+        cnn.input_y: y_batch,
+        cnn.dropout_keep_prob: 0.6
+      }
+      _, step, summaries, loss, accuracy = sess.run(
+          [train_op, global_step, train_summary_op, cnn.loss, cnn.accuracy],
+          feed_dict)
+      time_str = datetime.datetime.now().isoformat()
+      print("{}: step {}, loss {:g}, acc {:g}".format(time_str, step, loss, accuracy))
+      train_summary_writer.add_summary(summaries, step)
+
+  def dev_step(x_batch, y_batch, writer=None):
+      """
+      Evaluates model on a dev set
+      """
+      feed_dict = {
+        cnn.input_x: x_batch,
+        cnn.input_y: y_batch,
+        cnn.dropout_keep_prob: 1.0
+      }
+      step, summaries, loss, accuracy = sess.run(
+          [global_step, dev_summary_op, cnn.loss, cnn.accuracy],
+          feed_dict)
+      time_str = datetime.datetime.now().isoformat()
+      print("{}: step {}, loss {:g}, acc {:g}".format(time_str, step, loss, accuracy))
+      if writer:
+          writer.add_summary(summaries, step)
+
+  # Generate batches
+  batches = reader.batch_iter(
+      list(zip(x_train, y_train)), 100, 200)
+  # Training loop. For each batch...
+  for batch in batches:
+      x_batch, y_batch = zip(*batch)
+      train_step(x_batch, y_batch)
+      current_step = tf.train.global_step(sess, global_step)
+      if current_step % 100 == 0:
+          print("\nEvaluation:")
+          dev_step(x_dev, y_dev, writer=dev_summary_writer)
+          print("")
+      if current_step % 100 == 0:
+          path = saver.save(sess, checkpoint_prefix, global_step=current_step)
+          print("Saved model checkpoint to {}\n".format(path))
+
 
 def main(argv=None):
   train_data,train_labels,eval_data,eval_labels = preprocess()
