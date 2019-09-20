@@ -18,8 +18,8 @@ def load_images(example_path):
     for filename in filenames:
       file_path_list.append(os.path.join(parent, filename))
       image_name_list.append(filename)
-  images = load_and_preprocess_image(file_path_list[0:5], 100, 100)
-  return (images,image_name_list[0:5])
+  images = load_and_preprocess_image(file_path_list[0:5000], 100, 100)
+  return (images,image_name_list[0:5000])
 
 def load_and_preprocess_image(files, height, width):
   img_tensor_list = []
